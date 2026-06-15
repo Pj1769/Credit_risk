@@ -1,24 +1,33 @@
-from __future__ import annotations
+"""
+utils/scoring_engine.py
+Smart Collections Prioritization Agent — Bajaj Finance DMS
+Loads the trained logistic regression PD model and scores accounts.
+Auto-retrains if pickle files are missing or incompatible.
+"""
 
-from pathlib import Path
+from __future__ import annotations
+import os
 import pickle
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-
+# ── Paths ──────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+FEATURE_COLS = [
+    "DPD", "Bounce_Count", "Contact_Attempts",
+    "Successful_Contacts", "Promise_to_Pay",
+    "Last_Payment_Days", "Credit_Score",
+    "EMI_Amount", "Loan_Amount", "Tenure_Amount",
+]
 
-def _first_existing_path(candidates: list[Path]) -> Path:
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    checked = "\n".join(str(path) for path in candidates)
-    raise FileNotFoundError(f"No model artifact found. Checked:\n{checked}")
+TARGET_COL = "Default_Label"
 
 
-def _model_paths() -> dict[str, list[Path]]:
+# ── Internal helpers ───────────────────────────────────────────────────────────
+def _candidate_paths() -> dict:
     return {
         "model": [
             PROJECT_ROOT / "models" / "pd_model.pkl",
@@ -32,118 +41,192 @@ def _model_paths() -> dict[str, list[Path]]:
         "features": [
             PROJECT_ROOT / "models" / "feature_names.pkl",
             PROJECT_ROOT / "feature_cols.pkl",
+            PROJECT_ROOT / "feature_names.pkl",
         ],
     }
 
 
-def load_model():
-    paths = _model_paths()
-    model_path = _first_existing_path(paths["model"])
-    scaler_path = _first_existing_path(paths["scaler"])
-    features_path = _first_existing_path(paths["features"])
-
-    with open(model_path, "rb") as handle:
-        model = pickle.load(handle)
-    with open(scaler_path, "rb") as handle:
-        scaler = pickle.load(handle)
-    with open(features_path, "rb") as handle:
-        features = pickle.load(handle)
-
-    return model, scaler, features
+def _first_existing(paths: list[Path]) -> Path | None:
+    for p in paths:
+        if p.exists():
+            return p
+    return None
 
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    aliases = {
-        "Promise_To_Pay": "Promise_to_Pay",
+# ── Auto trainer ───────────────────────────────────────────────────────────────
+def _train_fresh():
+    """Train a new model from loan_accounts.xlsx and save fresh pkl files."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import train_test_split
+
+    data_path = PROJECT_ROOT / "data" / "loan_accounts.xlsx"
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"Data file not found at {data_path}. "
+            "Make sure data/loan_accounts.xlsx is in your repository."
+        )
+
+    df = pd.read_excel(data_path)
+
+    # Normalise column name aliases
+    rename_map = {
+        "Tenure_Months":         "Tenure_Amount",
+        "Promise_To_Pay":        "Promise_to_Pay",
         "Last_Payment_Days_Ago": "Last_Payment_Days",
-        "Tenure_Months": "Tenure_Amount",
-        "Customer Name": "Customer_Name",
-        "Loan Tenure": "Tenure_Amount",
     }
-    renamed = df.copy()
-    for source, target in aliases.items():
-        if source in renamed.columns and target not in renamed.columns:
-            renamed = renamed.rename(columns={source: target})
-    return renamed
+    for src, tgt in rename_map.items():
+        if src in df.columns and tgt not in df.columns:
+            df = df.rename(columns={src: tgt})
 
+    # Build target column if absent
+    if TARGET_COL not in df.columns:
+        df[TARGET_COL] = (df["DPD"] >= 90).astype(int)
 
-def _get_bucket(pd_prob: float) -> str:
-    if pd_prob >= 0.75:
-        return "Critical"
-    if pd_prob >= 0.50:
-        return "High"
-    if pd_prob >= 0.25:
-        return "Medium"
-    return "Low"
-
-
-def _get_priority(pd_prob: float, dpd: float, emi: float) -> str:
-    score = pd_prob * 50 + min(dpd / 180, 1) * 30 + min(emi / 45000, 1) * 20
-    if score >= 60:
-        return "P1 - Call immediately"
-    if score >= 40:
-        return "P2 - Call today"
-    if score >= 20:
-        return "P3 - Call this week"
-    return "P4 - Low urgency"
-
-
-def _get_action(bucket: str, promise_to_pay: int) -> str:
-    actions = {
-        "Critical": "Escalate to senior agent + field visit if PTP broken",
-        "High": "Immediate call + send payment link",
-        "Medium": "Scheduled callback + NACH re-presentation",
-        "Low": "Automated IVR reminder",
-    }
-    action = actions.get(bucket, "Unknown")
-    if promise_to_pay and bucket in ("High", "Critical"):
-        action += " | PTP Follow-up"
-    return action
-
-
-def score_single(input_dict: dict, model, scaler, features) -> dict:
-    row = _normalize_columns(pd.DataFrame([input_dict]))
-    missing = [feature for feature in features if feature not in row.columns]
+    missing = [c for c in FEATURE_COLS if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing required fields: {missing}")
+        raise ValueError(f"Missing columns in dataset: {missing}")
 
-    row = row[features]
-    scaled = scaler.transform(row)
-    pd_score = float(model.predict_proba(scaled)[0][1])
-    bucket = _get_bucket(pd_score)
-    priority = _get_priority(
-        pd_score,
-        float(row.iloc[0].get("DPD", 0)),
-        float(row.iloc[0].get("EMI_Amount", 0)),
+    X = df[FEATURE_COLS].fillna(0)
+    y = df[TARGET_COL]
+
+    X_train, _, y_train, _ = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
     )
-    promise_to_pay = int(row.iloc[0].get("Promise_to_Pay", 0) or 0)
+
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+
+    model = LogisticRegression(
+        max_iter=1000, class_weight="balanced",
+        random_state=42, solver="lbfgs"
+    )
+    model.fit(X_train_s, y_train)
+
+    # Save to models/ folder
+    models_dir = PROJECT_ROOT / "models"
+    models_dir.mkdir(exist_ok=True)
+
+    with open(models_dir / "pd_model.pkl", "wb") as f:
+        pickle.dump(model, f)
+    with open(models_dir / "scaler.pkl", "wb") as f:
+        pickle.dump(scaler, f)
+    with open(models_dir / "feature_names.pkl", "wb") as f:
+        pickle.dump(FEATURE_COLS, f)
+
+    return model, scaler, FEATURE_COLS
+
+
+# ── Public loader ──────────────────────────────────────────────────────────────
+def load_model():
+    """
+    Load model artifacts from disk.
+    If files are missing OR incompatible (pickle version mismatch),
+    automatically retrains from the raw dataset.
+    """
+    candidates = _candidate_paths()
+
+    model_path   = _first_existing(candidates["model"])
+    scaler_path  = _first_existing(candidates["scaler"])
+    features_path = _first_existing(candidates["features"])
+
+    if model_path and scaler_path and features_path:
+        try:
+            with open(model_path, "rb") as f:
+                model = pickle.load(f)
+            with open(scaler_path, "rb") as f:
+                scaler = pickle.load(f)
+            with open(features_path, "rb") as f:
+                features = pickle.load(f)
+            return model, scaler, features
+        except Exception:
+            # Pickle incompatibility — retrain silently
+            pass
+
+    # Either files missing or failed to load — retrain
+    return _train_fresh()
+
+
+# ── Risk classification ────────────────────────────────────────────────────────
+def _classify(pd_score: float):
+    if pd_score >= 75:
+        bucket   = "Critical"
+        priority = "Priority 1 — Call immediately"
+        action   = ("⚠️ Immediate outbound call required. Escalate to senior collections agent. "
+                    "Discuss settlement options, NACH re-presentation, and legal notice risk.")
+    elif pd_score >= 50:
+        bucket   = "High"
+        priority = "Priority 2 — Call today"
+        action   = ("📞 Schedule call within today's shift. Focus on PTP collection and NACH "
+                    "mandate reactivation. Offer EMI restructuring if needed.")
+    elif pd_score >= 25:
+        bucket   = "Medium"
+        priority = "Priority 3 — Call this week"
+        action   = ("🔔 Queue for this week's outbound campaign. Send WhatsApp/SMS reminder "
+                    "first. Collect PTP date and monitor.")
+    else:
+        bucket   = "Low"
+        priority = "Priority 4 — Monitor"
+        action   = ("✅ Low default risk. Include in automated IVR/SMS campaign. "
+                    "No manual call needed unless DPD increases.")
+    return bucket, priority, action
+
+
+# ── Single account scorer ──────────────────────────────────────────────────────
+def score_single(input_data: dict, model, scaler, features: list) -> dict:
+    row = pd.DataFrame([{f: input_data.get(f, 0) for f in features}])
+
+    if scaler is not None:
+        row_scaled = scaler.transform(row)
+    else:
+        row_scaled = row.values
+
+    pd_prob  = model.predict_proba(row_scaled)[0][1]
+    pd_score = round(pd_prob * 100, 1)
+    bucket, priority, action = _classify(pd_score)
 
     return {
-        "pd_score": round(pd_score * 100, 2),
+        "pd_score":    pd_score,
         "risk_bucket": bucket,
-        "priority": priority,
-        "call_action": _get_action(bucket, promise_to_pay),
+        "priority":    priority,
+        "call_action": action,
     }
 
 
-def score_portfolio(df: pd.DataFrame, model, scaler, features) -> pd.DataFrame:
-    df = _normalize_columns(df)
-    missing = [feature for feature in features if feature not in df.columns]
+# ── Portfolio scorer ───────────────────────────────────────────────────────────
+def score_portfolio(df: pd.DataFrame, model, scaler, features: list) -> pd.DataFrame:
+    # Normalise column aliases
+    rename_map = {
+        "Tenure_Months":         "Tenure_Amount",
+        "Promise_To_Pay":        "Promise_to_Pay",
+        "Last_Payment_Days_Ago": "Last_Payment_Days",
+    }
+    for src, tgt in rename_map.items():
+        if src in df.columns and tgt not in df.columns:
+            df = df.rename(columns={src: tgt})
+
+    missing = [f for f in features if f not in df.columns]
     if missing:
         raise ValueError(f"Missing columns in uploaded file: {missing}")
 
-    x_scaled = scaler.transform(df[features])
-    pd_scores = model.predict_proba(x_scaled)[:, 1]
+    X = df[features].fillna(0)
+    X_scaled = scaler.transform(X) if scaler is not None else X.values
 
-    scored = df.copy()
-    scored["PD_Score_%"] = np.round(pd_scores * 100, 2)
-    scored["Risk_Bucket"] = scored["PD_Score_%"].apply(lambda score: _get_bucket(score / 100))
-    scored["Priority_Rank"] = scored["PD_Score_%"].rank(ascending=False, method="first").astype(int)
-    scored["Call_Action"] = scored.apply(
-        lambda row: _get_action(
-            _get_bucket(float(row["PD_Score_%"]) / 100),
-            int(row.get("Promise_to_Pay", 0) or 0),
-        ),
-        axis=1,
-    )
-    return scored.sort_values("Priority_Rank")
+    pd_probs = model.predict_proba(X_scaled)[:, 1]
+    df = df.copy()
+    df["PD_Score_%"] = (pd_probs * 100).round(1)
+
+    buckets, priorities, actions = [], [], []
+    for score in df["PD_Score_%"]:
+        b, p, a = _classify(score)
+        buckets.append(b)
+        priorities.append(p)
+        actions.append(a)
+
+    df["Risk_Bucket"] = buckets
+    df["Priority"]    = priorities
+    df["Call_Action"] = actions
+    df = df.sort_values("PD_Score_%", ascending=False).reset_index(drop=True)
+    df.insert(0, "Priority_Rank", range(1, len(df) + 1))
+
+    return df
